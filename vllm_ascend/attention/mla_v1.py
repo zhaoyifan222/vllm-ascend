@@ -107,6 +107,9 @@ class AscendMLAPrefillMetadata:
     cp_prefill_mask: torch.Tensor = None
     computed_lens_cp_sp: np.array = None
     prefix_attn_seqlens: torch.Tensor = None
+    prefix_attn_seqlens_kv: torch.Tensor = None
+    prefix_kv_recover_idx: torch.Tensor = None
+    prefix_kv_start: torch.Tensor = None
 
 @dataclass
 class AscendMLADecodeMetadata:
@@ -209,6 +212,11 @@ class AscendMLAMetadataBuilder:
         self.max_blocks = (vllm_config.model_config.max_model_len +
                            self.block_size - 1) // self.block_size
         self.chunked_prefill_enabled = scheduler_config.chunked_prefill_enabled
+        self.cp_size = self.vllm_config.parallel_config.context_parallel_size
+        self.cp_rank = get_context_model_parallel_rank()
+        self.enable_sp = self.vllm_config.parallel_config.enable_sequence_parallel
+        self.sp_size = self.vllm_config.parallel_config.context_parallel_size if self.enable_sp else 1
+        self.cp_sp_size = self.cp_size * self.sp_size
         if self.chunked_prefill_enabled:
             self.chunked_prefill_workspace_size = min(
                 # Max sure there is enough for 8 full length request or at least
@@ -300,6 +308,8 @@ class AscendMLAMetadataBuilder:
         all_tokens_of_cp_sp=common_attn_metadata.all_tokens_of_cp_sp
         computed_lens_cp_sp=common_attn_metadata.computed_lens_cp_sp
         prefix_attn_seqlens=common_attn_metadata.prefix_attn_seqlens
+        prefix_attn_seqlens_kv=common_attn_metadata.prefix_attn_seqlens_kv
+        prefix_kv_recover_idx=common_attn_metadata.prefix_kv_recover_idx
         q_head_idx_tensor = common_attn_metadata.q_head_idx_tensor
         q_tail_idx_tensor = common_attn_metadata.q_tail_idx_tensor
         kv_with_q_head_nomask_idx_tensor = common_attn_metadata.kv_with_q_head_nomask_idx_tensor
@@ -424,6 +434,9 @@ class AscendMLAMetadataBuilder:
                 cp_prefill_mask=cp_prefill_mask,
                 computed_lens_cp_sp=computed_lens_cp_sp,
                 prefix_attn_seqlens=prefix_attn_seqlens,
+                prefix_attn_seqlens_kv=prefix_attn_seqlens_kv,
+                prefix_kv_recover_idx=prefix_kv_recover_idx,
+                prefix_kv_start=torch.zeros(num_prefills, dtype=torch.int32).to(device, non_blocking=True),
             )
 
         decode_metadata = None
@@ -823,53 +836,54 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         nope_cache = kv_cache[0]
         rope_cache = kv_cache[1]
-        computed_lens = attn_metadata.prefill.computed_lens_cp_sp  # reqnum,ranknum
-        max_computed_len = np.max(computed_lens)
-
-        batch_size = computed_lens.shape[0]
-        block_size = nope_cache.size(1)
+        computed_lens = attn_metadata.prefill.computed_lens_cp_sp  # reqnum, cprank, sprank
         block_tables = attn_metadata.prefill.block_table
-        max_num_blocks_per_seq = block_tables.size(1)
 
-        cache_kv_c = nope_cache[block_tables].view(
-            batch_size, max_num_blocks_per_seq * block_size,
-            -1)[:, :max_computed_len, :]
-        cache_k_pe = rope_cache[block_tables].view(
-            batch_size, max_num_blocks_per_seq * block_size,
-            -1)[:, :max_computed_len, :]
+        toks = np.sum(computed_lens[:, self.cp_rank, self.sp_rank])  # reqnum*seqlen
+        num_heads = nope_cache.size(2)
+        latent_kv_dim = nope_cache.size(-1)
+        rope_dim = rope_cache.size(-1)
 
-        # temporarily all-gather; all-gather-v could be better
+        cache_kv_c = torch.empty(toks,
+                                    num_heads,
+                                    latent_kv_dim,
+                                    dtype=query.dtype,
+                                    device=query.device)
+        cache_k_pe = torch.empty(toks,
+                            num_heads,
+                            rope_dim,
+                            dtype=query.dtype,
+                            device=query.device)
+        if toks > 0:
+            torch_npu.atb.npu_paged_cache_load(
+                nope_cache,
+                rope_cache,
+                block_tables,
+                attn_metadata.prefill.prefix_attn_seqlens_kv,
+                seq_starts=attn_metadata.prefill.prefix_kv_start,
+                key=cache_kv_c,
+                value=cache_k_pe,
+            )
+
         cache_kv_c_k_pe = torch.cat([cache_kv_c, cache_k_pe], dim=-1)
-        chunk_cache_kv_c_k_pe = [torch.empty_like(cache_kv_c_k_pe) for _ in range(self.cp_size * self.sp_size)]   #ranknum,3,max_computed_len,576
-        if self.cp_size > 1:
-            if self.sp_size > 1:
-                cache_kv_c_k_pe = get_cpsp_group().all_gather(cache_kv_c_k_pe, 0)
-            else:
-                cache_kv_c_k_pe = get_cp_group().all_gather(cache_kv_c_k_pe, 0)
-        else:
-            cache_kv_c_k_pe = get_cp_group().all_gather(cache_kv_c_k_pe, 0)
+        output_split_sizes = np.sum(computed_lens.reshape(-1, self.cp_size * self.sp_size), axis=0).tolist()
+        allgathered_prefix_kv = torch.empty(sum(output_split_sizes), cache_kv_c_k_pe.size(1), cache_kv_c_k_pe.size(2), dtype=query.dtype, device=query.device)
+        
+        group_to_gather = get_cpsp_group()
+        torch_npu.distributed.all_gather_into_tensor_uneven(
+            allgathered_prefix_kv,
+            cache_kv_c_k_pe,
+            output_split_sizes=output_split_sizes,
+            group=group_to_gather.device_group,
+            async_op=False
+        )
+        reordered_prefix_kv = torch.index_select(allgathered_prefix_kv, 0, attn_metadata.prefill.prefix_kv_recover_idx)
 
-        computed_kv_batch = []
-        # temporarily loop; index_select could be better 
-        for req_id in range(batch_size):
-            computed_kv_req = []
-            for rank in range(self.cp_size * self.sp_size):
-                computed_lens_req = computed_lens[req_id, rank]
-                computed_kv = chunk_cache_kv_c_k_pe[rank][req_id,:computed_lens_req]   # computed_lens_req, 576
-                if computed_kv is not None and computed_kv.nelement() > 0:
-                    computed_kv_req.append(computed_kv)
-            if len(computed_kv_req) > 0:
-                computed_kv_req = torch.cat(computed_kv_req, dim=0)
-                computed_kv_batch.append(computed_kv_req)
-
-        assert len(computed_kv_batch) > 0
-        computed_kv_batch = torch.cat(computed_kv_batch, dim=0)  # numreq*computed_lens_req, 576
-
-        kv_c_normed, k_pe = computed_kv_batch.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_c_normed, k_pe = reordered_prefix_kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_nope, value = self.kv_b_proj(kv_c_normed)[0].view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim).split(
                 [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k_pe = k_pe.unsqueeze(dim=1).expand((*k_nope.shape[:-1], -1))
+        k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
         q_pe = query[..., self.qk_nope_head_dim:]
         q_nope = query[..., :self.qk_nope_head_dim]
 

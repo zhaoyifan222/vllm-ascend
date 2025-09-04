@@ -63,6 +63,10 @@ class AscendCommonAttentionMetadata:
 
     prefix_attn_seqlens: torch.Tensor = None
 
+    prefix_attn_seqlens_kv: torch.Tensor = None
+
+    prefix_kv_recover_idx: torch.Tensor = None
+
     q_head_idx_tensor: torch.Tensor = None
 
     q_tail_idx_tensor: torch.Tensor = None

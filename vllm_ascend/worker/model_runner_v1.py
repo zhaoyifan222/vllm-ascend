@@ -395,8 +395,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.kv_idx_names = defaultdict(int)
         self.extra_long_seq_kwargs = defaultdict(int)
         self.prefix_attn_seqlens = None
+        self.prefix_attn_seqlens_kv = None
         self.all_tokens_of_cp_sp = None
         self.computed_lens_cp_sp = None
+        self.prefix_kv_recover_idx = None
 
     def _use_aclgraph(self) -> bool:
         return self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and self.compilation_config.level == CompilationLevel.PIECEWISE and not self.model_config.enforce_eager
@@ -1049,6 +1051,33 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                                 dtype=torch.int32)
         return max_tokens_across_dp_cpu - num_tokens, num_tokens_after_padding
 
+    def _cal_kv_recover_idx_prefix(
+            self,
+    ):
+        num_computed_tokens_cp_sp_batch = np.array(self.input_batch.num_computed_tokens_cp_sp[:self.input_batch.num_reqs])  # req,cp,sp
+        num_all_computed_tokens = np.sum(np.array(num_computed_tokens_cp_sp_batch))
+        full_indices = list(range(num_all_computed_tokens))
+
+        num_computed_tokens_cp_sp_batch = num_computed_tokens_cp_sp_batch.reshape(-1, self.cp_sp_size)
+
+        req_offset = np.zeros(self.input_batch.num_reqs + 1, dtype=np.int32)
+        req_offset[1:] = np.cumsum(self.input_batch.num_computed_tokens_cpu[:self.input_batch.num_reqs])
+
+        req_rank_offset = np.zeros((self.input_batch.num_reqs, self.cp_sp_size + 1), dtype=np.int32)
+        req_rank_offset[:,1:] = np.cumsum(num_computed_tokens_cp_sp_batch, axis=1)
+
+        prefix_kv_recover_idx = [[] for _ in range(self.cp_sp_size)]
+        for rank in range(self.cp_sp_size):
+            for i in range(self.input_batch.num_reqs):
+                prefix_kv_recover_idx[rank].extend(full_indices[req_offset[i] + req_rank_offset[i, rank]: req_offset[i] + req_rank_offset[i, rank + 1]])
+
+        prefix_kv_recover_idx_cpu = torch.tensor(sum(prefix_kv_recover_idx,[]), dtype=torch.int32).argsort()
+        prefix_kv_recover_idx_npu = torch.zeros(num_all_computed_tokens,
+                                        dtype=torch.int32,
+                                        device=self.device)
+        prefix_kv_recover_idx_npu.copy_(prefix_kv_recover_idx_cpu, non_blocking=True)
+        self.prefix_kv_recover_idx = prefix_kv_recover_idx_npu
+
     def _num_scheduled_tokens_prefill_cp(
             self,
             num_scheduled_tokens,
@@ -1172,8 +1201,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         start_index = 0
         num_scheduled_tokens_for_slot = np.empty(num_reqs, dtype=np.int32)
         self.cp_kv_recover_idx = [[] for _ in range(self.cp_size)]
-        for rank in range(self.cp_size):
-            self.cp_kv_recover_idx[rank] = []  # 保证各个rank的list独立
         for i, req_id in enumerate(self.input_batch.req_ids):
             num_tokens = scheduler_output.num_scheduled_tokens[req_id]
             if self.cp_size > 1 and num_tokens > 1:
@@ -1272,9 +1299,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         self.num_actual_tokens_cp_full = total_num_scheduled_tokens * (
             self.cp_size if is_prefill > 0 else 1)
-        self.computed_lens_cp_sp = np.array(
-            self.input_batch.num_computed_tokens_cp_sp[:num_reqs]).reshape(num_reqs, self.cp_sp_size)
+        self.computed_lens_cp_sp = np.array(self.input_batch.num_computed_tokens_cp_sp[:num_reqs])
         if self.cp_size > 1 and is_prefill > 0:
+            if attn_state in [AscendAttentionState.ChunkedPrefill,
+                    AscendAttentionState.PrefillCacheHit]:
+                self._cal_kv_recover_idx_prefix()
             cp_kv_recover_idx = torch.zeros(self.num_actual_tokens_cp_full,
                                             dtype=torch.int32,
                                             device=self.device)
@@ -1348,8 +1377,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             head_attn_nomask_seqlens = torch.tensor([chunk_seqlens, kv_with_q_head_nomask_seqlens], dtype=torch.int32)
             tail_attn_nomask_seqlens = torch.tensor([chunk_seqlens, kv_with_q_tail_nomask_seqlens], dtype=torch.int32)
             cp_prefill_mask = torch.triu(torch.ones(512, 512, device=self.device, dtype=torch.bfloat16), 1)
-            prefix_attn_seqlens_kv = np.sum(self.computed_lens_cp_sp, axis=1).tolist()
+            prefix_attn_seqlens_kv = np.sum(self.computed_lens_cp_sp.reshape(-1, self.cp_sp_size), axis=1).tolist()
             self.prefix_attn_seqlens = torch.tensor([chunk_seqlens, prefix_attn_seqlens_kv], dtype=torch.int32)
+            self.prefix_attn_seqlens_kv = torch.tensor(self.computed_lens_cp_sp[:, self.cp_rank, self.sp_rank], dtype=torch.int32).to(self.device)
 
             self.extra_long_seq_kwargs = {
                 'attn_mask_seqlens': attn_mask_seqlens,
@@ -1408,6 +1438,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             all_tokens_of_cp_sp=self.all_tokens_of_cp_sp,
             computed_lens_cp_sp=self.computed_lens_cp_sp,
             prefix_attn_seqlens=self.prefix_attn_seqlens,
+            prefix_attn_seqlens_kv=self.prefix_attn_seqlens_kv,
+            prefix_kv_recover_idx=self.prefix_kv_recover_idx,
             q_head_idx_tensor=self.q_head_idx_tensor,
             q_tail_idx_tensor=self.q_tail_idx_tensor,
             q_full_idx=self.q_full_idx,
