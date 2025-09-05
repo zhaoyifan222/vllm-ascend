@@ -21,7 +21,8 @@ from vllm.distributed import (get_tensor_model_parallel_world_size,
                               get_tp_group,
                               get_context_model_parallel_world_size,
                               get_context_model_parallel_rank,
-                              get_cp_group)
+                              get_cp_group,
+                              get_cpsp_group)
 from vllm.logger import logger
 
 import vllm_ascend.envs as envs_ascend
@@ -104,7 +105,11 @@ class AscendMLAPrefillMetadata:
     tail_attn_nomask_seqlens: torch.Tensor = None
     q_full_idx: torch.Tensor = None
     cp_prefill_mask: torch.Tensor = None
-
+    computed_lens_cp_sp: np.array = None
+    prefix_attn_seqlens: torch.Tensor = None
+    prefix_attn_seqlens_kv: torch.Tensor = None
+    prefix_kv_recover_idx: torch.Tensor = None
+    prefix_kv_start: torch.Tensor = None
 
 @dataclass
 class AscendMLADecodeMetadata:
@@ -119,8 +124,7 @@ class AscendMLADecodeMetadata:
     attn_mask: Optional[torch.Tensor] = None
     sin: torch.Tensor = None
     cos: torch.Tensor = None
-    num_computed_tokens_of_cp_sp: list[list[list[int]]] = None
-
+    all_tokens_of_cp_sp: np.array = None
 
 @dataclass
 class AscendMLAMetadata:
@@ -208,6 +212,11 @@ class AscendMLAMetadataBuilder:
         self.max_blocks = (vllm_config.model_config.max_model_len +
                            self.block_size - 1) // self.block_size
         self.chunked_prefill_enabled = scheduler_config.chunked_prefill_enabled
+        self.cp_size = self.vllm_config.parallel_config.context_parallel_size
+        self.cp_rank = get_context_model_parallel_rank()
+        self.enable_sp = self.vllm_config.parallel_config.enable_sequence_parallel
+        self.sp_size = self.vllm_config.parallel_config.context_parallel_size if self.enable_sp else 1
+        self.cp_sp_size = self.cp_size * self.sp_size
         if self.chunked_prefill_enabled:
             self.chunked_prefill_workspace_size = min(
                 # Max sure there is enough for 8 full length request or at least
@@ -296,7 +305,11 @@ class AscendMLAMetadataBuilder:
 
         cp_kv_recover_idx = common_attn_metadata.cp_kv_recover_idx
         num_actual_tokens_cp_full = common_attn_metadata.num_actual_tokens_cp_full
-        num_computed_tokens_of_cp_sp = common_attn_metadata.num_computed_tokens_of_cp_sp
+        all_tokens_of_cp_sp=common_attn_metadata.all_tokens_of_cp_sp
+        computed_lens_cp_sp=common_attn_metadata.computed_lens_cp_sp
+        prefix_attn_seqlens=common_attn_metadata.prefix_attn_seqlens
+        prefix_attn_seqlens_kv=common_attn_metadata.prefix_attn_seqlens_kv
+        prefix_kv_recover_idx=common_attn_metadata.prefix_kv_recover_idx
         q_head_idx_tensor = common_attn_metadata.q_head_idx_tensor
         q_tail_idx_tensor = common_attn_metadata.q_tail_idx_tensor
         kv_with_q_head_nomask_idx_tensor = common_attn_metadata.kv_with_q_head_nomask_idx_tensor
@@ -418,7 +431,12 @@ class AscendMLAMetadataBuilder:
                 head_attn_nomask_seqlens=head_attn_nomask_seqlens,
                 tail_attn_nomask_seqlens=tail_attn_nomask_seqlens,
                 q_full_idx=q_full_idx,
-                cp_prefill_mask=cp_prefill_mask
+                cp_prefill_mask=cp_prefill_mask,
+                computed_lens_cp_sp=computed_lens_cp_sp,
+                prefix_attn_seqlens=prefix_attn_seqlens,
+                prefix_attn_seqlens_kv=prefix_attn_seqlens_kv,
+                prefix_kv_recover_idx=prefix_kv_recover_idx,
+                prefix_kv_start=torch.zeros(num_prefills, dtype=torch.int32).to(device, non_blocking=True),
             )
 
         decode_metadata = None
@@ -451,7 +469,7 @@ class AscendMLAMetadataBuilder:
                 actual_seq_lengths_q=actual_seq_lengths_q,
                 sin=sin,
                 cos=cos,
-                num_computed_tokens_of_cp_sp=num_computed_tokens_of_cp_sp,
+                all_tokens_of_cp_sp=all_tokens_of_cp_sp,
             )
 
         return self.metadata_cls(  # type: ignore
@@ -532,6 +550,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.sp_size = get_tensor_model_parallel_world_size() if self.enable_sp else 1
         self.sp_rank = get_tensor_model_parallel_rank() if self.enable_sp else 0
         self.sp_group = get_tp_group().device_group
+        self.cp_sp_group = get_cpsp_group().device_group
 
     def _v_up_proj_and_o_proj(self, x):
         # Convert from (B, N, L) to (N, B, L)
@@ -807,12 +826,111 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         return attn_output
 
+
+    def _forward_prefixcache_cp(
+        self,
+        query: torch.Tensor,
+        kv_cache: Tuple[torch.Tensor],
+        attn_metadata: AscendMLAMetadata,
+    ) -> torch.Tensor:
+
+        nope_cache = kv_cache[0]
+        rope_cache = kv_cache[1]
+        computed_lens = attn_metadata.prefill.computed_lens_cp_sp  # reqnum, cprank, sprank
+        block_tables = attn_metadata.prefill.block_table
+
+        toks = np.sum(computed_lens[:, self.cp_rank, self.sp_rank])  # reqnum*seqlen
+        num_heads = nope_cache.size(2)
+        latent_kv_dim = nope_cache.size(-1)
+        rope_dim = rope_cache.size(-1)
+
+        cache_kv_c = torch.empty(toks,
+                                    num_heads,
+                                    latent_kv_dim,
+                                    dtype=query.dtype,
+                                    device=query.device)
+        cache_k_pe = torch.empty(toks,
+                            num_heads,
+                            rope_dim,
+                            dtype=query.dtype,
+                            device=query.device)
+        if toks > 0:
+            torch_npu.atb.npu_paged_cache_load(
+                nope_cache,
+                rope_cache,
+                block_tables,
+                attn_metadata.prefill.prefix_attn_seqlens_kv,
+                seq_starts=attn_metadata.prefill.prefix_kv_start,
+                key=cache_kv_c,
+                value=cache_k_pe,
+            )
+
+        cache_kv_c_k_pe = torch.cat([cache_kv_c, cache_k_pe], dim=-1)
+        output_split_sizes = np.sum(computed_lens.reshape(-1, self.cp_size * self.sp_size), axis=0).tolist()
+        allgathered_prefix_kv = torch.empty(sum(output_split_sizes), cache_kv_c_k_pe.size(1), cache_kv_c_k_pe.size(2), dtype=query.dtype, device=query.device)
+        
+        group_to_gather = get_cpsp_group()
+        torch_npu.distributed.all_gather_into_tensor_uneven(
+            allgathered_prefix_kv,
+            cache_kv_c_k_pe,
+            output_split_sizes=output_split_sizes,
+            group=group_to_gather.device_group,
+            async_op=False
+        )
+        reordered_prefix_kv = torch.index_select(allgathered_prefix_kv, 0, attn_metadata.prefill.prefix_kv_recover_idx)
+
+        kv_c_normed, k_pe = reordered_prefix_kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        k_nope, value = self.kv_b_proj(kv_c_normed)[0].view(
+            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim).split(
+                [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
+        q_pe = query[..., self.qk_nope_head_dim:]
+        q_nope = query[..., :self.qk_nope_head_dim]
+
+        attn_output = torch.empty(query.size(0),
+                                    self.num_heads,
+                                    self.v_head_dim,
+                                    dtype=k_pe.dtype,
+                                    device=k_pe.device)
+        attn_lse = torch.empty(self.num_heads,
+                                query.size(0),
+                                dtype=torch.float32,
+                                device=k_pe.device)
+
+        seqlen = attn_metadata.prefill.prefix_attn_seqlens
+        mask = attn_metadata.prefill.cp_prefill_mask
+
+        torch_npu.atb.npu_ring_mla(
+            q_nope=q_nope,
+            q_rope=q_pe,
+            k_nope=k_nope,
+            k_rope=k_pe,
+            value=value,
+            mask=mask,
+            seqlen=seqlen,
+            head_num=self.num_heads,
+            kv_head_num=self.num_heads,
+            pre_out=None,
+            prev_lse=None,
+            qk_scale=self.scale,
+            kernel_type="kernel_type_high_precision",
+            mask_type="no_mask",
+            input_layout="type_bsnd",
+            calc_type="calc_type_first_ring",
+            output=attn_output,
+            softmax_lse=attn_lse
+        )
+
+        return attn_output, attn_lse
+
+
     def _forward_prefill_cp(
         self,
         query: torch.Tensor,
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         attn_metadata: AscendMLAMetadata,
+        output_prefix: Tuple[torch.Tensor] = None,
     ) -> torch.Tensor:
         num_tokens = query.size(0) # 单卡的token数
         # 构造存放attention的，分别存储requests以及单block的attention的值
@@ -835,6 +953,13 @@ class AscendMLAImpl(MLAAttentionImpl):
         head_attn_nomask_seqlens = attn_metadata.prefill.head_attn_nomask_seqlens
         tail_attn_nomask_seqlens = attn_metadata.prefill.tail_attn_nomask_seqlens
         mask = attn_metadata.prefill.cp_prefill_mask
+        head_attn_output, head_lse, tail_attn_output, tail_lse = None, None, None, None
+        if output_prefix:
+            attn_output_prefix, attn_lse_prefix = output_prefix
+            head_attn_output = torch.index_select(attn_output_prefix, 0, q_head_idx)
+            head_lse = torch.index_select(attn_lse_prefix, 1, q_head_idx)
+            tail_attn_output = torch.index_select(attn_output_prefix, 0, q_tail_idx)
+            tail_lse = torch.index_select(attn_lse_prefix, 1, q_tail_idx)
 
         # 1. 负载均衡中，Q前半段的Attention计算
         # cp_rank0: Q0*KV0
@@ -849,7 +974,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             kv_nomask_idx=kv_with_q_head_nomask_idx,
             attn_mask_seqlens=attn_mask_seqlens,
             attn_nomask_seqlens=head_attn_nomask_seqlens,
-            mask=mask
+            mask=mask,
+            attn_output_prefix=head_attn_output,
+            lse_prefix=head_lse,
         )
 
         # 2. 负载均衡中，Q后半段的Attention计算
@@ -865,7 +992,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             kv_nomask_idx=kv_with_q_tail_nomask_idx,
             attn_mask_seqlens=attn_mask_seqlens,
             attn_nomask_seqlens=tail_attn_nomask_seqlens,
-            mask=mask
+            mask=mask,
+            attn_output_prefix=tail_attn_output,
+            lse_prefix=tail_lse,
         )
 
         # 3. 合并前半段和后半段的输出
@@ -890,7 +1019,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         kv_nomask_idx: torch.Tensor,
         attn_mask_seqlens: torch.Tensor,
         attn_nomask_seqlens: torch.Tensor,
-        mask: torch.Tensor
+        mask: torch.Tensor,
+        attn_output_prefix: torch.Tensor = None,
+        lse_prefix: torch.Tensor = None,
     ):
         attn_output = torch.empty(q_nope.shape[0], # 长度现在是每个req的cp_block求和
                                     self.num_heads,
@@ -901,6 +1032,10 @@ class AscendMLAImpl(MLAAttentionImpl):
                                 q_pe.shape[0],
                                 dtype=torch.float32,
                                 device=k_pe.device)
+        if attn_output_prefix is not None:
+            calc_type="calc_type_default"
+        else:
+            calc_type="calc_type_first_ring"
         # mask
         k_nope_mask = torch.index_select(k_nope, 0, kv_mask_idx)
         value_mask = torch.index_select(value, 0, kv_mask_idx)
@@ -915,13 +1050,13 @@ class AscendMLAImpl(MLAAttentionImpl):
             seqlen=attn_mask_seqlens,
             head_num=self.num_heads,
             kv_head_num=self.num_heads,
-            pre_out=None,
-            prev_lse=None,
+            pre_out=attn_output_prefix,
+            prev_lse=lse_prefix,
             qk_scale=self.scale,
             kernel_type="kernel_type_high_precision",
             mask_type="mask_type_triu",
             input_layout="type_bsnd",
-            calc_type="calc_type_first_ring",
+            calc_type=calc_type,
             output=attn_output,
             softmax_lse=attn_lse
         )
@@ -1031,7 +1166,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         decode_metadata = attn_metadata.decode
 
         # use cp & sp splited computed token nums from scheduler to compute actual seq_len and seq_mask
-        num_computed_tokens_of_cp_sp = np.array(decode_metadata.num_computed_tokens_of_cp_sp) # [bs, cp_size, sp_size]
+        num_computed_tokens_of_cp_sp = decode_metadata.all_tokens_of_cp_sp # [bs, cp_size, sp_size]
         seq_mask_cp = torch.where(torch.tensor(num_computed_tokens_of_cp_sp.sum(2)) == 0, 0, 1).to(torch.uint8).to(q_pe.device)
         seq_mask_sp = torch.where(torch.tensor(num_computed_tokens_of_cp_sp[:, self.cp_rank, :]) == 0, 0, 1).to(torch.uint8).to(q_pe.device)
         seq_len = num_computed_tokens_of_cp_sp[:, self.cp_rank, self.sp_rank]
@@ -1258,6 +1393,17 @@ class AscendMLAImpl(MLAAttentionImpl):
         kv_c_normed = kv_c_normed.view(
             [num_actual_toks, self.num_kv_heads, -1])
 
+        output_prefix = None
+        if self.cp_size * self.sp_size > 1 and attn_metadata.num_prefills > 0:
+            if attn_metadata.attn_state in [
+                    AscendAttentionState.ChunkedPrefill,
+                    AscendAttentionState.PrefillCacheHit]:
+                output_prefix = self._forward_prefixcache_cp(
+                                            prefill_q,
+                                            kv_cache,
+                                            attn_metadata,
+                                            )
+
         if self.cp_size > 1 and attn_metadata.num_prefills > 0:
             prefill_k_c_normed = prefill_k_c_normed.unsqueeze(1)
             prefill_kv_c_k_pe = torch.cat([prefill_k_c_normed, prefill_k_pe], dim=-1)
@@ -1288,7 +1434,9 @@ class AscendMLAImpl(MLAAttentionImpl):
                 output_prefill = self._forward_prefill_cp(prefill_q,
                                                           prefill_k_c_normed,
                                                           prefill_k_pe,
-                                                          attn_metadata)
+                                                          attn_metadata,
+                                                          output_prefix,
+                                                          )
             else:
                 output_prefill = self._forward_prefill(prefill_q,
                                                        prefill_k_c_normed,
